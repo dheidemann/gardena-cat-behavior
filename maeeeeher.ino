@@ -24,13 +24,32 @@ const char* MOWER_ACTION_TYPE = "PARK_UNTIL_NEXT_TASK";
 
 const char* GARDENA_BASE_URL = "https://api.smart.gardena.dev/v2";
 
-const unsigned long CHECK_INTERVAL_MS = 15UL * 60UL * 1000UL;
+// Open-Meteo allows up to 10000 calls/day.
+const unsigned long WEATHER_CHECK_INTERVAL_MS = 2UL * 60UL * 1000UL;
 
-unsigned long lastCheckTime = 0;
+// The Gardena/Husqvarna cloud API is limited to one call every 15 minutes.
+const unsigned long GARDENA_MIN_INTERVAL_MS = 15UL * 60UL * 1000UL;
+
+unsigned long lastWeatherCheckTime = 0;
+unsigned long lastGardenaApiCallMs = 0;
+bool hasCalledGardenaApi = false;
+
 bool rainActionSentWhileRaining = false;
 
 String mowerAccessToken;
 unsigned long mowerTokenExpiresAtMs = 0;
+
+String cachedMowerId;
+
+bool gardenaRateLimitOk() {
+  if (!hasCalledGardenaApi) return true;
+  return (millis() - lastGardenaApiCallMs) >= GARDENA_MIN_INTERVAL_MS;
+}
+
+void markGardenaApiCalled() {
+  lastGardenaApiCallMs = millis();
+  hasCalledGardenaApi = true;
+}
 
 String urlEncode(const String& input) {
   String out;
@@ -233,8 +252,12 @@ String findMowerId() {
   http.addHeader("Accept", "application/vnd.api+json");
 
   int httpCode = http.GET();
-  if (httpCode != HTTP_CODE_OK) return "";
-  
+  markGardenaApiCalled();
+  if (httpCode != HTTP_CODE_OK) {
+    http.end();
+    return "";
+  }
+
   JsonDocument doc;
   deserializeJson(doc, http.getString());
   String locId = doc["data"][0]["id"];
@@ -243,8 +266,9 @@ String findMowerId() {
   http.begin(client, String(GARDENA_BASE_URL) + "/locations/" + locId);
   http.addHeader("Authorization", "Bearer " + mowerAccessToken);
   http.addHeader("X-Api-Key", HUSQVARNA_APP_KEY);
-  
+
   http.GET();
+  markGardenaApiCalled();
   deserializeJson(doc, http.getString());
   http.end();
 
@@ -279,6 +303,7 @@ bool sendMowerAction(const String& serviceId, const char* actionType) {
   serializeJson(doc, body);
 
   int httpCode = http.PUT(body);
+  markGardenaApiCalled();
   http.end();
 
   return (httpCode == 202);
@@ -301,8 +326,8 @@ void loop() {
     return;
   }
 
-  if (lastCheckTime == 0 || (millis() - lastCheckTime >= CHECK_INTERVAL_MS)) {
-    lastCheckTime = millis();
+  if (lastWeatherCheckTime == 0 || (millis() - lastWeatherCheckTime >= WEATHER_CHECK_INTERVAL_MS)) {
+    lastWeatherCheckTime = millis();
 
     Serial.println();
 
@@ -312,14 +337,30 @@ void loop() {
       Serial.println("Rain detected.");
 
       if (!rainActionSentWhileRaining) {
-        String mowerId = findMowerId();
-        if (mowerId.length() > 0) {
-          if (sendMowerAction(mowerId, MOWER_ACTION_TYPE)) {
-            rainActionSentWhileRaining = true;
-            Serial.println("Mower command sent successfully.");
-          }
+        if (!gardenaRateLimitOk()) {
+          unsigned long waitMs = GARDENA_MIN_INTERVAL_MS - (millis() - lastGardenaApiCallMs);
+          Serial.print("Gardena API rate limit in effect, retrying in ~");
+          Serial.print(waitMs / 1000UL);
+          Serial.println("s.");
         } else {
-          Serial.println("Could not resolve mower ID.");
+          if (cachedMowerId.isEmpty()) {
+            cachedMowerId = findMowerId();
+          }
+
+          if (cachedMowerId.length() > 0) {
+            if (gardenaRateLimitOk()) {
+              if (sendMowerAction(cachedMowerId, MOWER_ACTION_TYPE)) {
+                rainActionSentWhileRaining = true;
+                Serial.println("Mower command sent successfully.");
+              } else {
+                Serial.println("Mower command failed.");
+              }
+            } else {
+              Serial.println("Gardena API rate limit hit while resolving mower ID; will send command on next check.");
+            }
+          } else {
+            Serial.println("Could not resolve mower ID.");
+          }
         }
       } else {
         Serial.println("Rain action already sent for this rain event.");
